@@ -170,6 +170,11 @@ function clearPending() {
 function buildPanel(root) {
   panelEl = root;
   root.classList.add("pri-panel");
+  root.style.display = "flex";
+  root.style.flexDirection = "column";
+  root.style.height = "100%";
+  root.style.minHeight = "520px";
+  root.style.gap = "8px";
   root.innerHTML = `
     <div class="pri-header">ComfyUI PR Installer</div>
     <div class="pri-status pri-box">Loading status...</div>
@@ -187,7 +192,7 @@ function buildPanel(root) {
       <button class="pri-btn pri-btn-small" data-action="refresh">Refresh</button>
     </div>
 
-    <div class="pri-list pri-box">Loading PR list...</div>
+    <div class="pri-list pri-box" style="flex:1; overflow-y:auto; max-height:420px; min-height:220px;">Loading PR list...</div>
 
     <div class="pri-manual">
       <input class="pri-num" type="number" min="1" placeholder="PR #" />
