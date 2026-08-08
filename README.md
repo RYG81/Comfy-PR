@@ -1,4 +1,4 @@
-# ComfyUI-PR-Installer
+# ComfyUI-PR-Installer (ALPHA - Not fully tested yet, looking for some tester willing to test this in fresh comfy clone. I do not suggest using this in working comfy clone yet.
 
 A ComfyUI addon that lets non-technical users install Pull Requests from the official `comfyanonymous/ComfyUI` repository without using command-line git.
 
