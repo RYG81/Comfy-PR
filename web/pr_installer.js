@@ -1,60 +1,33 @@
 /**
  * ComfyUI-PR-Installer Frontend Extension
- * Now includes PR listing from GitHub API for official repo.
+ * Toolbar button via the modern `actionBarButtons` API + PR list modal.
+ *
+ * WHY THIS REWRITE: the previous version injected a button by searching the
+ * DOM for `.comfy-menu`, `button[title='Save']` and `.comfy-button`. Those are
+ * OLD-frontend (litegraph) selectors. In the current Vue frontend the top bar
+ * is `.comfyui-top-bar`, there is no `.comfy-menu`, no `button[title='Save']`,
+ * and buttons carry the class `comfyui-button` (note the extra "ui"). So every
+ * selector misses, the code falls through to `document.body.appendChild(btn)`,
+ * and the button lands as a stray floating element outside the toolbar (or is
+ * hidden behind it). `actionBarButtons` is declarative: ComfyUI renders the
+ * button for you, no DOM hunting, no timing/retry, survives frontend re-renders.
  */
-(function () {
-  "use strict";
+import { app } from "/scripts/app.js";
 
-  const INIT_INTERVAL = setInterval(() => {
-    if (typeof app === "undefined" || !app.registerExtension) return;
-    clearInterval(INIT_INTERVAL);
-    initExtension();
-  }, 300);
+const PLUGIN = "ComfyUI.PRInstaller";
 
-  // Create button immediately so it works even if app registration fails
-  if (typeof document !== 'undefined') {
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', () => createToolbarButton());
-    } else {
-      createToolbarButton();
-    }
+function openModal() {
+  if (document.getElementById("pr-installer-modal")) {
+    document.getElementById("pr-installer-modal").style.display = "flex";
+    refreshStatus();
+    loadList();
+    return;
   }
-
-  function initExtension() {
-    app.registerExtension({
-      name: "ComfyUI.PRInstaller",
-      async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        if (nodeData.python_module === "custom_nodes.ComfyUI-PR-Installer.nodes.pr_installer") {
-          // hook available if needed
-        }
-      },
-    });
-    createToolbarButton();
-  }
-
-  function createToolbarButton() {
-    const menu = document.querySelector(".comfy-menu") || document.querySelector("#comfy-menu") || document.body;
-    const btn = document.createElement("button");
-    btn.innerText = "PR Installer";
-    btn.title = "Install official ComfyUI PRs from list";
-    btn.style.cssText = "margin-left:8px;padding:6px 12px;border-radius:4px;background:#2a2a2a;color:#eee;border:1px solid #555;cursor:pointer;font-size:12px;font-family:sans-serif;";
-    btn.onclick = () => openModal();
-    const ref = document.querySelector("button[title='Save']") || document.querySelector(".comfy-button") || menu;
-    if (ref && ref.parentElement) ref.parentElement.appendChild(btn);
-    else menu.appendChild(btn);
-  }
-
-  function openModal() {
-    if (document.getElementById("pr-installer-modal")) {
-      document.getElementById("pr-installer-modal").style.display = "flex";
-      refreshStatus();
-      loadList();
-      return;
-    }
-    const overlay = document.createElement("div");
-    overlay.id = "pr-installer-modal";
-    overlay.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:sans-serif;color:#eee;";
-    overlay.innerHTML = `
+  const overlay = document.createElement("div");
+  overlay.id = "pr-installer-modal";
+  overlay.style.cssText =
+    "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:sans-serif;color:#eee;";
+  overlay.innerHTML = `
       <div style="background:#181818;border:1px solid #444;border-radius:10px;padding:24px;min-width:460px;max-width:92vw;max-height:92vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,0.8);">
         <h2 style="margin-top:0;color:#e6e6e6;">ComfyUI Official PR Installer</h2>
         <p style="font-size:12px;color:#aaa;margin-top:-8px;">Browse open PRs from <code>comfyanonymous/ComfyUI</code>, install with one click, or revert to stable.</p>
@@ -88,58 +61,62 @@
         </div>
       </div>
     `;
-    overlay.onclick = (e) => { if (e.target === overlay) closeModal(); };
-    document.body.appendChild(overlay);
-    refreshStatus();
-    loadList();
-  }
-
-  window.closeModal = () => {
-    const m = document.getElementById("pr-installer-modal");
-    if (m) m.style.display = "none";
+  overlay.onclick = (e) => {
+    if (e.target === overlay) closeModal();
   };
+  document.body.appendChild(overlay);
+  refreshStatus();
+  loadList();
+}
 
-  window.refreshStatus = async () => {
-    const box = document.getElementById("pr-status-box");
-    if (!box) return;
-    box.innerText = "Fetching status...";
-    try {
-      const res = await fetch("/pr-installer/status");
-      const data = await res.json();
-      box.innerHTML = `
+window.closeModal = () => {
+  const m = document.getElementById("pr-installer-modal");
+  if (m) m.style.display = "none";
+};
+
+window.refreshStatus = async () => {
+  const box = document.getElementById("pr-status-box");
+  if (!box) return;
+  box.innerText = "Fetching status...";
+  try {
+    const res = await fetch("/pr-installer/status");
+    const data = await res.json();
+    box.innerHTML = `
         <strong>Root:</strong> ${data.root || "?"}<br>
         <strong>Git repo:</strong> ${data.git_repo ? "Yes" : "No"}<br>
         <strong>Origin = ComfyUI:</strong> ${data.comfy_origin ? "Yes" : "No"}<br>
         <strong>Branch:</strong> ${data.branch || "?"}<br>
         <strong>SHA:</strong> <code>${data.sha || "?"}</code>
       `;
-    } catch (e) {
-      box.innerText = "Status unavailable. Ensure ComfyUI server is running.";
-      appendLog("Status error: " + e.message);
-    }
-  };
+  } catch (e) {
+    box.innerText = "Status unavailable. Ensure ComfyUI server is running.";
+    appendLog("Status error: " + e.message);
+  }
+};
 
-  window.loadList = async () => {
-    const listDiv = document.getElementById("pr-list");
-    if (!listDiv) return;
-    listDiv.innerHTML = "Fetching PR list from GitHub...";
-    try {
-      const res = await fetch("/pr-installer/list");
-      const data = await res.json();
-      if (data.status !== "ok" || !data.pr_list) {
-        listDiv.innerHTML = `<div style="color:#ff8888;">Failed to load list: ${data.message || "Unknown"}</div>`;
-        return;
-      }
-      if (data.pr_list.length === 0) {
-        listDiv.innerHTML = '<div style="color:#aaa;">No open PRs found.</div>';
-        return;
-      }
-      let html = "";
-      data.pr_list.forEach(pr => {
-        const title = (pr.title || "Untitled").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        const bodyRaw = (pr.body || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        const bodyText = bodyRaw ? bodyRaw.substring(0, 2000) + (bodyRaw.length > 2000 ? "\n... (truncated)" : "") : "<em style='color:#888;'>No description provided.</em>";
-        html += `
+window.loadList = async () => {
+  const listDiv = document.getElementById("pr-list");
+  if (!listDiv) return;
+  listDiv.innerHTML = "Fetching PR list from GitHub...";
+  try {
+    const res = await fetch("/pr-installer/list");
+    const data = await res.json();
+    if (data.status !== "ok" || !data.pr_list) {
+      listDiv.innerHTML = `<div style="color:#ff8888;">Failed to load list: ${data.message || "Unknown"}</div>`;
+      return;
+    }
+    if (data.pr_list.length === 0) {
+      listDiv.innerHTML = '<div style="color:#aaa;">No open PRs found.</div>';
+      return;
+    }
+    let html = "";
+    data.pr_list.forEach((pr) => {
+      const title = (pr.title || "Untitled").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const bodyRaw = (pr.body || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const bodyText = bodyRaw
+        ? bodyRaw.substring(0, 2000) + (bodyRaw.length > 2000 ? "\n... (truncated)" : "")
+        : "<em style='color:#888;'>No description provided.</em>";
+      html += `
           <div style="padding:10px;border-bottom:1px solid #333;background:#171717;border-radius:6px;margin-bottom:8px;">
             <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
               <button onclick="prInstallFromList(${pr.pr_number})" style="padding:6px 12px;background:#2a7bff;border:none;border-radius:4px;color:#fff;cursor:pointer;font-weight:bold;font-size:12px;white-space:nowrap;">Install #${pr.pr_number}</button>
@@ -150,73 +127,105 @@
             </div>
             <div style="background:#0a0a0a;padding:10px;border-radius:5px;border:1px solid #333;max-height:160px;overflow-y:auto;font-size:11.5px;color:#ccc;white-space:pre-wrap;line-height:1.35;">${bodyText}</div>
           </div>`;
-      });
-      listDiv.innerHTML = html;
-    } catch (e) {
-      listDiv.innerHTML = `<div style="color:#ff8888;">Error loading list: ${e.message}</div>`;
-    }
-  };
-
-  window.prInstallFromList = (num) => {
-    document.getElementById("pr-num").value = num;
-    prInstall();
-  };
-
-  window.prInstall = async () => {
-    const input = document.getElementById("pr-num");
-    const val = parseInt(input.value, 10);
-    const log = document.getElementById("pr-log");
-    if (!val || val < 1) {
-      appendLog("Please enter a valid PR number (> 0).");
-      return;
-    }
-    appendLog(`Starting install for PR #${val}...`);
-    try {
-      const res = await fetch("/pr-installer/install", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pr: val }),
-      });
-      const data = await res.json();
-      if (data.status === "ok") {
-        appendLog("SUCCESS: " + data.message);
-        appendLog("Dependencies: " + (data.dependencies || "N/A"));
-        refreshStatus();
-      } else {
-        appendLog("ERROR: " + (data.message || "Unknown error"));
-      }
-    } catch (e) {
-      appendLog("Install request failed: " + e.message);
-    }
-  };
-
-  window.prRevert = async () => {
-    const log = document.getElementById("pr-log");
-    appendLog("Reverting to stable / latest release tag...");
-    try {
-      const res = await fetch("/pr-installer/revert", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "stable" }),
-      });
-      const data = await res.json();
-      if (data.status === "ok") {
-        appendLog("REVERTED: " + data.message);
-        refreshStatus();
-      } else {
-        appendLog("REVERT ERROR: " + (data.message || "Unknown"));
-      }
-    } catch (e) {
-      appendLog("Revert request failed: " + e.message);
-    }
-  };
-
-  function appendLog(msg) {
-    const log = document.getElementById("pr-log");
-    if (!log) return;
-    const line = document.createElement("div");
-    line.textContent = "[" + new Date().toLocaleTimeString() + "] " + msg;
-    log.appendChild(line);
-    log.scrollTop = log.scrollHeight;
+    });
+    listDiv.innerHTML = html;
+  } catch (e) {
+    listDiv.innerHTML = `<div style="color:#ff8888;">Error loading list: ${e.message}</div>`;
   }
-})();
+};
+
+window.prInstallFromList = (num) => {
+  document.getElementById("pr-num").value = num;
+  prInstall();
+};
+
+window.prInstall = async () => {
+  const input = document.getElementById("pr-num");
+  const val = parseInt(input.value, 10);
+  const log = document.getElementById("pr-log");
+  if (!val || val < 1) {
+    appendLog("Please enter a valid PR number (> 0).");
+    return;
+  }
+  appendLog(`Starting install for PR #${val}...`);
+  try {
+    const res = await fetch("/pr-installer/install", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pr: val }),
+    });
+    const data = await res.json();
+    if (data.status === "ok") {
+      appendLog("SUCCESS: " + data.message);
+      appendLog("Dependencies: " + (data.dependencies || "N/A"));
+      refreshStatus();
+    } else {
+      appendLog("ERROR: " + (data.message || "Unknown error"));
+    }
+  } catch (e) {
+    appendLog("Install request failed: " + e.message);
+  }
+};
+
+window.prRevert = async () => {
+  const log = document.getElementById("pr-log");
+  appendLog("Reverting to stable / latest release tag...");
+  try {
+    const res = await fetch("/pr-installer/revert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "stable" }),
+    });
+    const data = await res.json();
+    if (data.status === "ok") {
+      appendLog("REVERTED: " + data.message);
+      refreshStatus();
+    } else {
+      appendLog("REVERT ERROR: " + (data.message || "Unknown"));
+    }
+  } catch (e) {
+    appendLog("Revert request failed: " + e.message);
+  }
+};
+
+function appendLog(msg) {
+  const log = document.getElementById("pr-log");
+  if (!log) return;
+  const line = document.createElement("div");
+  line.textContent = "[" + new Date().toLocaleTimeString() + "] " + msg;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+// Open the modal from the toolbar button (declarative — no DOM hunting needed).
+function openInstaller() {
+  openModal();
+}
+
+app.registerExtension({
+  name: PLUGIN,
+
+  // The modern, supported way to put a button in the top action bar.
+  // ComfyUI owns the rendering; the button survives frontend re-renders.
+  actionBarButtons: [
+    {
+      icon: "icon-[lucide--git-pull-request]", // lucide iconify class; falls back to empty icon, label still shows
+      label: "PR Installer",
+      tooltip: "Browse and install official ComfyUI PRs",
+      class: "pr-installer-btn",
+      onClick: () => openInstaller(),
+    },
+  ],
+
+  // Keep the feature reachable even if the button is hidden / frontend differs:
+  // palette entry + Alt+P shortcut, independent of the DOM.
+  commands: [
+    {
+      id: "PRInstaller.Open",
+      label: "Open PR Installer",
+      icon: "icon-[lucide--git-pull-request]",
+      function: () => openInstaller(),
+    },
+  ],
+  keybindings: [{ combo: { key: "p", alt: true }, commandId: "PRInstaller.Open" }],
+});
