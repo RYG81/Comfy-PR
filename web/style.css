@@ -1,0 +1,11 @@
+/* Minimal styling for PR Installer modal if needed */
+#pr-installer-modal button:hover {
+  opacity: 0.9;
+}
+#pr-log::-webkit-scrollbar {
+  width: 6px;
+}
+#pr-log::-webkit-scrollbar-thumb {
+  background: #444;
+  border-radius: 3px;
+}
