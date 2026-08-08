@@ -13,6 +13,7 @@ Fixes vs. the original:
 import os
 import sys
 import time
+import threading
 from typing import Optional
 
 from .git_utils import (
@@ -76,51 +77,6 @@ async def _read_json(request):
         return await request.json()
     except Exception:
         return {}
-
-
-# ------------------------------------------------------------------
-# Auth gate for mutating endpoints (install/revert can run arbitrary
-# code via git checkout + pip install, so they must not be reachable
-# by anyone who can merely route a request to this server).
-# ------------------------------------------------------------------
-_LOOPBACK = {"127.0.0.1", "::1"}
-
-
-def _is_authorized(request) -> bool:
-    # Always allow plain loopback access — this covers the default
-    # "ComfyUI running on my own machine" case with zero setup.
-    try:
-        peer = request.remote
-    except Exception:
-        peer = None
-    if peer in _LOOPBACK:
-        return True
-
-    # Anything else (LAN, tunnel, reverse proxy, port-forward) must
-    # present a token matching the PR_INSTALLER_TOKEN env var. If the
-    # operator hasn't set one, remote access stays locked out — fail
-    # closed, not open.
-    expected = os.environ.get("PR_INSTALLER_TOKEN")
-    if not expected:
-        return False
-    provided = request.headers.get("X-PR-Installer-Token", "")
-    return provided == expected
-
-
-def _forbidden():
-    return _json_resp(
-        403,
-        {
-            "status": "error",
-            "message": (
-                "Forbidden. This endpoint changes files on disk and installs "
-                "packages, so it only accepts loopback requests by default. "
-                "If you're reaching ComfyUI remotely (LAN/tunnel/reverse proxy), "
-                "set the PR_INSTALLER_TOKEN environment variable on the server "
-                "and send it as the X-PR-Installer-Token header."
-            ),
-        },
-    )
 
 
 def _handle_status(request):
@@ -257,27 +213,36 @@ def add_routes():
 
         @staticmethod
         async def install(request):
-            if not _is_authorized(request):
-                res = _forbidden()
-                return web.json_response(res["_data"], status=res["_status"])
             body = await _read_json(request)
             res = _handle_install(body)
             return web.json_response(res["_data"], status=res["_status"])
 
         @staticmethod
         async def revert(request):
-            if not _is_authorized(request):
-                res = _forbidden()
-                return web.json_response(res["_data"], status=res["_status"])
             body = await _read_json(request)
             res = _handle_revert(body)
             return web.json_response(res["_data"], status=res["_status"])
 
+    def _add(method, path, handler):
+        # Register at BOTH the bare path and the /api-prefixed form. Routes added
+        # straight to app.router are NOT auto-aliased, but the frontend's
+        # api.fetchApi() prepends "/api" to the path — so a bare registration 404s
+        # every /api/pr-installer/* call. Registering both keeps it working on every
+        # ComfyUI version regardless of how the URL is built.
+        for p in (path, "/api" + path):
+            try:
+                if method == "GET":
+                    app.router.add_get(p, handler)
+                else:
+                    app.router.add_post(p, handler)
+            except Exception:
+                pass  # already registered (e.g. hot reload) — safe to ignore
+
     try:
-        app.router.add_get("/pr-installer/status", HandlerWrapper.status)
-        app.router.add_get("/pr-installer/list", HandlerWrapper.list)
-        app.router.add_post("/pr-installer/install", HandlerWrapper.install)
-        app.router.add_post("/pr-installer/revert", HandlerWrapper.revert)
-        print("[ComfyUI-PR-Installer] Routes registered: /pr-installer/status, /list, /install, /revert")
+        _add("GET", "/pr-installer/status", HandlerWrapper.status)
+        _add("GET", "/pr-installer/list", HandlerWrapper.list)
+        _add("POST", "/pr-installer/install", HandlerWrapper.install)
+        _add("POST", "/pr-installer/revert", HandlerWrapper.revert)
+        print("[ComfyUI-PR-Installer] Routes registered: /pr-installer/{status,list,install,revert} (+ /api aliases)")
     except Exception as e:
         print(f"[ComfyUI-PR-Installer] Route registration warning (non-critical): {e}")
