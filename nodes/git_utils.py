@@ -69,7 +69,13 @@ def run_git(cmd: List[str], cwd: Optional[str] = None, check: bool = True) -> su
 
 def create_backup_branch(pr_number: int, cwd: Optional[str] = None) -> str:
     branch_name = f"pr-installer-backup-pr-{pr_number}-{int(time.time())}"
-    run_git(["branch", branch_name], cwd=cwd, check=False)
+    result = run_git(["branch", branch_name], cwd=cwd, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not create backup branch '{branch_name}' "
+            f"(exit {result.returncode}): {result.stderr.strip()}\n"
+            "Refusing to proceed without a safety backup."
+        )
     return branch_name
 
 
@@ -88,6 +94,12 @@ def checkout_pr(pr_number: int, cwd: Optional[str] = None) -> Tuple[str, str]:
     root = cwd or get_comfyui_root()
     if not is_git_repo(root):
         raise RuntimeError(f"Not a git repo at {root}. Cannot install PR.")
+    if not is_origin_comfyui(root):
+        raise RuntimeError(
+            f"Refusing to install PR #{pr_number}: 'origin' at {root} does not "
+            "point to comfyanonymous/ComfyUI or Comfy-Org/ComfyUI. This tool only "
+            "installs PRs against the official repo."
+        )
     # Backup current state
     backup = create_backup_branch(pr_number, cwd=root)
     # Fetch PR
@@ -113,9 +125,13 @@ def revert_stable(cwd: Optional[str] = None) -> Tuple[str, str]:
             tag = "main"
     except Exception:
         tag = "main"
-    # Checkout stable
-    run_git(["checkout", tag], cwd=root, check=False)
-    # Clean untracked only if user wants; we skip destructive clean by default
+    # Checkout stable — check the result instead of assuming success
+    checkout_res = run_git(["checkout", tag], cwd=root, check=False)
+    if checkout_res.returncode != 0:
+        raise RuntimeError(
+            f"Revert failed: 'git checkout {tag}' exited "
+            f"{checkout_res.returncode}: {checkout_res.stderr.strip()}"
+        )
     result = run_git(["rev-parse", "HEAD"], cwd=root)
     sha = result.stdout.strip()
     return tag, f"Reverted to stable ({tag}) at sha {sha}."

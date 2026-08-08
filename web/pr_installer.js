@@ -2,174 +2,365 @@
  * ComfyUI-PR-Installer Frontend Extension
  * Toolbar button via the modern `actionBarButtons` API + PR list modal.
  *
- * WHY THIS REWRITE: the previous version injected a button by searching the
- * DOM for `.comfy-menu`, `button[title='Save']` and `.comfy-button`. Those are
- * OLD-frontend (litegraph) selectors. In the current Vue frontend the top bar
- * is `.comfyui-top-bar`, there is no `.comfy-menu`, no `button[title='Save']`,
- * and buttons carry the class `comfyui-button` (note the extra "ui"). So every
- * selector misses, the code falls through to `document.body.appendChild(btn)`,
- * and the button lands as a stray floating element outside the toolbar (or is
- * hidden behind it). `actionBarButtons` is declarative: ComfyUI renders the
- * button for you, no DOM hunting, no timing/retry, survives frontend re-renders.
+ * WHY THE ACTIONBAR REWRITE: the previous version injected a button by
+ * searching the DOM for `.comfy-menu`, `button[title='Save']` and
+ * `.comfy-button`. Those are OLD-frontend (litegraph) selectors. In the
+ * current Vue frontend the top bar is `.comfyui-top-bar`, there is no
+ * `.comfy-menu`, no `button[title='Save']`, and buttons carry the class
+ * `comfyui-button` (note the extra "ui"). Every selector missed, the code
+ * fell through to `document.body.appendChild(btn)`, and the button landed
+ * as a stray floating element outside the toolbar. `actionBarButtons` is
+ * declarative: ComfyUI renders the button for you, no DOM hunting, no
+ * timing/retry, survives frontend re-renders.
+ *
+ * UI NOTES (this pass): styling moved out of inline `style` attributes and
+ * into style.css using ComfyUI's own CSS variables (--comfy-menu-bg,
+ * --border-color, etc.) so the panel follows the user's theme instead of a
+ * hardcoded dark palette. Event handling moved off global `window.*` +
+ * inline `onclick` and onto addEventListener / delegation. Installing or
+ * reverting now requires an inline confirmation step first, since both
+ * actions check out untested code and can run pip installs against the
+ * user's real ComfyUI install.
  */
 import { app } from "/scripts/app.js";
 
 const PLUGIN = "ComfyUI.PRInstaller";
+const MODAL_ID = "pr-installer-modal";
 
-function openModal() {
-  if (document.getElementById("pr-installer-modal")) {
-    document.getElementById("pr-installer-modal").style.display = "flex";
-    refreshStatus();
-    loadList();
-    return;
-  }
+// ComfyUI auto-loads a custom node's *.js under web/ as extensions, but it
+// does NOT auto-link any *.css that lives alongside them — that has to be
+// done explicitly, or none of the classes below ever take effect (no
+// position:fixed, no display toggle, the modal just renders inline and
+// invisibly wherever it landed in the DOM).
+function ensureStylesheet() {
+  if (document.getElementById("pri-stylesheet")) return;
+  const link = document.createElement("link");
+  link.id = "pri-stylesheet";
+  link.rel = "stylesheet";
+  link.href = new URL("./style.css", import.meta.url).href;
+  document.head.appendChild(link);
+}
+ensureStylesheet();
+
+// Full PR list from the last successful fetch, kept around so the search
+// box can filter client-side without re-hitting the GitHub-backed endpoint.
+let lastPrList = [];
+// { kind: 'install', pr: number } | { kind: 'revert' } | null
+let pendingAction = null;
+
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildModal() {
   const overlay = document.createElement("div");
-  overlay.id = "pr-installer-modal";
-  overlay.style.cssText =
-    "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:sans-serif;color:#eee;";
+  overlay.id = MODAL_ID;
+  overlay.className = "pri-overlay";
   overlay.innerHTML = `
-      <div style="background:#181818;border:1px solid #444;border-radius:10px;padding:24px;min-width:460px;max-width:92vw;max-height:92vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,0.8);">
-        <h2 style="margin-top:0;color:#e6e6e6;">ComfyUI Official PR Installer</h2>
-        <p style="font-size:12px;color:#aaa;margin-top:-8px;">Browse open PRs from <code>comfyanonymous/ComfyUI</code>, install with one click, or revert to stable.</p>
+    <div class="pri-modal" role="dialog" aria-modal="true" aria-labelledby="pri-title">
+      <div class="pri-header">
+        <div class="pri-header-text">
+          <h2 id="pri-title">ComfyUI Official PR Installer</h2>
+          <p>Browse open PRs from <code>comfyanonymous/ComfyUI</code>, install with one click, or revert to stable.</p>
+        </div>
+        <button type="button" class="pri-close" data-action="close" aria-label="Close">&times;</button>
+      </div>
 
-        <div id="pr-status-box" style="background:#222;padding:10px;border-radius:6px;margin-bottom:14px;font-size:12px;line-height:1.4;color:#ccc;min-height:60px;">Loading status...</div>
-
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-          <strong style="font-size:13px;color:#ddd;">Open PRs</strong>
-          <button onclick="loadList()" style="padding:4px 10px;background:#4a7bff;border:none;border-radius:4px;color:#fff;cursor:pointer;font-size:12px;">Refresh List</button>
+      <div class="pri-body">
+        <div class="pri-section">
+          <div class="pri-section-label"><strong>Status</strong></div>
+          <div id="pri-status" class="pri-status-placeholder">Loading status…</div>
         </div>
 
-        <div id="pr-list" style="max-height:260px;overflow-y:auto;background:#111;border:1px solid #333;border-radius:6px;padding:8px;margin-bottom:14px;min-height:60px;font-size:12px;color:#ccc;line-height:1.3;">
-          Loading PR list...
+        <div class="pri-section">
+          <div class="pri-section-label">
+            <strong>Open PRs</strong>
+            <button type="button" class="pri-btn pri-btn--small" data-action="refresh-list">Refresh</button>
+          </div>
+          <input
+            type="search"
+            class="pri-search"
+            id="pri-search"
+            placeholder="Filter by title, author, or PR #…"
+            aria-label="Filter open PRs"
+          />
+          <div id="pri-list" class="pri-list">
+            <div class="pri-loading">Fetching PR list from GitHub…</div>
+          </div>
         </div>
 
-        <label style="font-weight:bold;font-size:13px;">Manual entry (if needed)</label>
-        <div style="display:flex;gap:8px;margin:6px 0 14px;">
-          <input id="pr-num" type="number" min="1" max="99999" value="" style="flex:1;padding:8px;border-radius:4px;border:1px solid #666;background:#111;color:#eee;font-size:13px;" placeholder="Enter PR # directly">
-          <button onclick="prInstall()" style="padding:8px 14px;background:#4a7bff;border:none;border-radius:4px;color:#fff;cursor:pointer;font-weight:bold;font-size:13px;">Install PR</button>
+        <div class="pri-section">
+          <label class="pri-manual-label" for="pri-num">Manual entry (if needed)</label>
+          <div class="pri-row">
+            <input id="pri-num" class="pri-num" type="number" min="1" max="99999" placeholder="Enter PR # directly" />
+            <button type="button" class="pri-btn pri-btn--primary" data-action="install-manual">Install PR</button>
+          </div>
         </div>
 
-        <div style="display:flex;gap:8px;margin-bottom:14px;">
-          <button onclick="prRevert()" style="flex:1;padding:10px;border-radius:4px;border:1px solid #777;background:#333;color:#ddd;cursor:pointer;font-size:13px;">Revert to Stable</button>
-          <button onclick="refreshStatus()" style="flex:1;padding:10px;border-radius:4px;border:1px solid #777;background:#333;color:#ddd;cursor:pointer;font-size:13px;">Refresh Status</button>
+        <div id="pri-confirm-slot"></div>
+
+        <div class="pri-section pri-actions">
+          <button type="button" class="pri-btn pri-btn--danger pri-btn--block" data-action="revert">Revert to Stable</button>
+          <button type="button" class="pri-btn pri-btn--block" data-action="refresh-status">Refresh Status</button>
         </div>
 
-        <div id="pr-log" style="background:#111;padding:10px;border-radius:6px;font-size:12px;color:#ccc;min-height:60px;max-height:120px;overflow-y:auto;border:1px solid #333;">Logs will appear here.</div>
-
-        <div style="margin-top:14px;text-align:right;">
-          <button onclick="closeModal()" style="padding:8px 16px;background:#555;border:none;border-radius:4px;color:#fff;cursor:pointer;">Close</button>
+        <div class="pri-section-label"><strong>Log</strong></div>
+        <div id="pri-log" class="pri-log" role="log" aria-live="polite">
+          <div class="pri-log-empty">Logs will appear here.</div>
         </div>
       </div>
-    `;
-  overlay.onclick = (e) => {
+    </div>
+  `;
+
+  overlay.addEventListener("click", (e) => {
     if (e.target === overlay) closeModal();
-  };
+  });
+  overlay.addEventListener("click", handleModalClick);
+  overlay.querySelector("#pri-search").addEventListener("input", handleSearchInput);
+  overlay.querySelector("#pri-num").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") requestInstall(parseManualPrNumber());
+  });
+
   document.body.appendChild(overlay);
+  return overlay;
+}
+
+function getModal() {
+  return document.getElementById(MODAL_ID) || buildModal();
+}
+
+function openModal() {
+  const modal = getModal();
+  modal.classList.add("is-open");
+  document.addEventListener("keydown", handleEscape);
   refreshStatus();
   loadList();
 }
 
-window.closeModal = () => {
-  const m = document.getElementById("pr-installer-modal");
-  if (m) m.style.display = "none";
-};
+function closeModal() {
+  const modal = document.getElementById(MODAL_ID);
+  if (!modal) return;
+  modal.classList.remove("is-open");
+  document.removeEventListener("keydown", handleEscape);
+  clearPendingAction();
+}
 
-window.refreshStatus = async () => {
-  const box = document.getElementById("pr-status-box");
+function handleEscape(e) {
+  if (e.key === "Escape") closeModal();
+}
+
+// ------------------------------------------------------------------
+// Delegated click handling for everything inside the modal
+// ------------------------------------------------------------------
+function handleModalClick(e) {
+  const btn = e.target.closest("[data-action]");
+  if (!btn) return;
+  const action = btn.dataset.action;
+
+  if (action === "close") return closeModal();
+  if (action === "refresh-status") return refreshStatus();
+  if (action === "refresh-list") return loadList();
+  if (action === "install-manual") return requestInstall(parseManualPrNumber());
+  if (action === "install-pr") return requestInstall(parseInt(btn.dataset.pr, 10));
+  if (action === "revert") return requestRevert();
+  if (action === "confirm-yes") return runPendingAction();
+  if (action === "confirm-no") return clearPendingAction();
+}
+
+function parseManualPrNumber() {
+  const input = document.getElementById("pri-num");
+  const val = parseInt(input?.value, 10);
+  return Number.isFinite(val) ? val : NaN;
+}
+
+// ------------------------------------------------------------------
+// Confirmation step — install/revert both mutate the real install, so
+// neither fires directly off a click. This renders a small inline banner
+// with an explicit second click required.
+// ------------------------------------------------------------------
+function requestInstall(prNumber) {
+  if (!Number.isFinite(prNumber) || prNumber < 1) {
+    appendLog("Enter a valid PR number (> 0).", "error");
+    return;
+  }
+  pendingAction = { kind: "install", pr: prNumber };
+  renderConfirm(
+    `Install PR #${prNumber}? This checks out untested code and runs pip install against your ComfyUI install. A backup branch is created first.`
+  );
+}
+
+function requestRevert() {
+  pendingAction = { kind: "revert" };
+  renderConfirm("Revert to the latest stable tag? This checks out over your current branch.");
+}
+
+function renderConfirm(message) {
+  const slot = document.getElementById("pri-confirm-slot");
+  if (!slot) return;
+  slot.innerHTML = `
+    <div class="pri-confirm">
+      <p>${escapeHtml(message)}</p>
+      <div class="pri-confirm-actions">
+        <button type="button" class="pri-btn pri-btn--small" data-action="confirm-no">Cancel</button>
+        <button type="button" class="pri-btn pri-btn--small pri-btn--primary" data-action="confirm-yes">Confirm</button>
+      </div>
+    </div>
+  `;
+}
+
+function clearPendingAction() {
+  pendingAction = null;
+  const slot = document.getElementById("pri-confirm-slot");
+  if (slot) slot.innerHTML = "";
+}
+
+function runPendingAction() {
+  const action = pendingAction;
+  clearPendingAction();
+  if (!action) return;
+  if (action.kind === "install") return doInstall(action.pr);
+  if (action.kind === "revert") return doRevert();
+}
+
+// ------------------------------------------------------------------
+// Status
+// ------------------------------------------------------------------
+async function refreshStatus() {
+  const box = document.getElementById("pri-status");
   if (!box) return;
-  box.innerText = "Fetching status...";
+  box.innerHTML = '<div class="pri-status-placeholder">Fetching status…</div>';
   try {
     const res = await fetch("/pr-installer/status");
     const data = await res.json();
+    if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
     box.innerHTML = `
-        <strong>Root:</strong> ${data.root || "?"}<br>
-        <strong>Git repo:</strong> ${data.git_repo ? "Yes" : "No"}<br>
-        <strong>Origin = ComfyUI:</strong> ${data.comfy_origin ? "Yes" : "No"}<br>
-        <strong>Branch:</strong> ${data.branch || "?"}<br>
-        <strong>SHA:</strong> <code>${data.sha || "?"}</code>
-      `;
+      <dl class="pri-status">
+        <dt>Root</dt><dd>${escapeHtml(data.root || "?")}</dd>
+        <dt>Git repo</dt><dd>${badge(data.git_repo)}</dd>
+        <dt>Origin = ComfyUI</dt><dd>${badge(data.comfy_origin)}</dd>
+        <dt>Branch</dt><dd>${escapeHtml(data.branch || "?")}</dd>
+        <dt>SHA</dt><dd><code>${escapeHtml(data.sha || "?")}</code></dd>
+      </dl>
+    `;
   } catch (e) {
-    box.innerText = "Status unavailable. Ensure ComfyUI server is running.";
-    appendLog("Status error: " + e.message);
+    box.innerHTML = '<div class="pri-status-placeholder">Status unavailable. Ensure the ComfyUI server is running.</div>';
+    appendLog("Status error: " + e.message, "error");
   }
-};
+}
 
-window.loadList = async () => {
-  const listDiv = document.getElementById("pr-list");
+function badge(ok) {
+  return ok
+    ? '<span class="pri-badge pri-badge--ok">Yes</span>'
+    : '<span class="pri-badge pri-badge--bad">No</span>';
+}
+
+// ------------------------------------------------------------------
+// PR list
+// ------------------------------------------------------------------
+async function loadList() {
+  const listDiv = document.getElementById("pri-list");
   if (!listDiv) return;
-  listDiv.innerHTML = "Fetching PR list from GitHub...";
+  listDiv.innerHTML = '<div class="pri-loading">Fetching PR list from GitHub…</div>';
   try {
     const res = await fetch("/pr-installer/list");
     const data = await res.json();
-    if (data.status !== "ok" || !data.pr_list) {
-      listDiv.innerHTML = `<div style="color:#ff8888;">Failed to load list: ${data.message || "Unknown"}</div>`;
+    if (!res.ok || data.status !== "ok" || !data.pr_list) {
+      listDiv.innerHTML = `<div class="pri-error">Failed to load list: ${escapeHtml(data.message || "Unknown error")}</div>`;
       return;
     }
-    if (data.pr_list.length === 0) {
-      listDiv.innerHTML = '<div style="color:#aaa;">No open PRs found.</div>';
-      return;
-    }
-    let html = "";
-    data.pr_list.forEach((pr) => {
-      const title = (pr.title || "Untitled").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const bodyRaw = (pr.body || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const bodyText = bodyRaw
-        ? bodyRaw.substring(0, 2000) + (bodyRaw.length > 2000 ? "\n... (truncated)" : "")
-        : "<em style='color:#888;'>No description provided.</em>";
-      html += `
-          <div style="padding:10px;border-bottom:1px solid #333;background:#171717;border-radius:6px;margin-bottom:8px;">
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-              <button onclick="prInstallFromList(${pr.pr_number})" style="padding:6px 12px;background:#2a7bff;border:none;border-radius:4px;color:#fff;cursor:pointer;font-weight:bold;font-size:12px;white-space:nowrap;">Install #${pr.pr_number}</button>
-              <div style="flex:1;min-width:0;">
-                <div style="font-size:13px;color:#eee;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${title.replace(/"/g, "'")}">${title}</div>
-                <div style="font-size:11px;color:#aaa;">by <strong>${pr.author || "?"}</strong> • ${pr.state || "?"} • <a href="${pr.url || "#"}" target="_blank" style="color:#4a7bff;text-decoration:none;">GitHub →</a></div>
-              </div>
-            </div>
-            <div style="background:#0a0a0a;padding:10px;border-radius:5px;border:1px solid #333;max-height:160px;overflow-y:auto;font-size:11.5px;color:#ccc;white-space:pre-wrap;line-height:1.35;">${bodyText}</div>
-          </div>`;
-    });
-    listDiv.innerHTML = html;
+    lastPrList = data.pr_list;
+    renderList(lastPrList);
   } catch (e) {
-    listDiv.innerHTML = `<div style="color:#ff8888;">Error loading list: ${e.message}</div>`;
+    listDiv.innerHTML = `<div class="pri-error">Error loading list: ${escapeHtml(e.message)}</div>`;
   }
-};
+}
 
-window.prInstallFromList = (num) => {
-  document.getElementById("pr-num").value = num;
-  prInstall();
-};
-
-window.prInstall = async () => {
-  const input = document.getElementById("pr-num");
-  const val = parseInt(input.value, 10);
-  const log = document.getElementById("pr-log");
-  if (!val || val < 1) {
-    appendLog("Please enter a valid PR number (> 0).");
+function renderList(items) {
+  const listDiv = document.getElementById("pri-list");
+  if (!listDiv) return;
+  if (items.length === 0) {
+    listDiv.innerHTML = '<div class="pri-empty">No matching open PRs.</div>';
     return;
   }
-  appendLog(`Starting install for PR #${val}...`);
+  listDiv.innerHTML = items.map(prCardHtml).join("");
+}
+
+function prCardHtml(pr) {
+  const title = escapeHtml(pr.title || "Untitled");
+  const author = escapeHtml(pr.author || "?");
+  const state = escapeHtml(pr.state || "?");
+  const url = pr.url || "#";
+  const bodyRaw = (pr.body || "").trim();
+  const bodyText = bodyRaw
+    ? escapeHtml(bodyRaw.slice(0, 2000)) + (bodyRaw.length > 2000 ? "\n… (truncated)" : "")
+    : "No description provided.";
+
+  return `
+    <div class="pri-pr-card">
+      <div class="pri-pr-row">
+        <button type="button" class="pri-btn pri-btn--primary pri-btn--small" data-action="install-pr" data-pr="${pr.pr_number}">
+          Install #${pr.pr_number}
+        </button>
+        <div class="pri-pr-main">
+          <div class="pri-pr-title" title="${title}">${title}</div>
+          <div class="pri-pr-meta">by <strong>${author}</strong> · ${state} · <a href="${url}" target="_blank" rel="noopener noreferrer">GitHub ↗</a></div>
+        </div>
+      </div>
+      <details>
+        <summary>Description</summary>
+        <div class="pri-pr-body">${bodyText}</div>
+      </details>
+    </div>
+  `;
+}
+
+function handleSearchInput(e) {
+  const q = e.target.value.trim().toLowerCase();
+  if (!q) return renderList(lastPrList);
+  const filtered = lastPrList.filter((pr) => {
+    return (
+      String(pr.pr_number).includes(q) ||
+      (pr.title || "").toLowerCase().includes(q) ||
+      (pr.author || "").toLowerCase().includes(q)
+    );
+  });
+  renderList(filtered);
+}
+
+// ------------------------------------------------------------------
+// Install / revert (actual network calls — only reached after confirm)
+// ------------------------------------------------------------------
+async function doInstall(prNumber) {
+  const buttons = disableActionButtons();
+  appendLog(`Starting install for PR #${prNumber}…`, "info");
   try {
     const res = await fetch("/pr-installer/install", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pr: val }),
+      body: JSON.stringify({ pr: prNumber }),
     });
     const data = await res.json();
-    if (data.status === "ok") {
-      appendLog("SUCCESS: " + data.message);
-      appendLog("Dependencies: " + (data.dependencies || "N/A"));
+    if (res.ok && data.status === "ok") {
+      appendLog(data.message, "success");
+      appendLog("Dependencies: " + (data.dependencies || "N/A"), "info");
       refreshStatus();
     } else {
-      appendLog("ERROR: " + (data.message || "Unknown error"));
+      appendLog(data.message || `Install failed (HTTP ${res.status})`, "error");
     }
   } catch (e) {
-    appendLog("Install request failed: " + e.message);
+    appendLog("Install request failed: " + e.message, "error");
+  } finally {
+    enableActionButtons(buttons);
   }
-};
+}
 
-window.prRevert = async () => {
-  const log = document.getElementById("pr-log");
-  appendLog("Reverting to stable / latest release tag...");
+async function doRevert() {
+  const buttons = disableActionButtons();
+  appendLog("Reverting to stable / latest release tag…", "info");
   try {
     const res = await fetch("/pr-installer/revert", {
       method: "POST",
@@ -177,27 +368,52 @@ window.prRevert = async () => {
       body: JSON.stringify({ mode: "stable" }),
     });
     const data = await res.json();
-    if (data.status === "ok") {
-      appendLog("REVERTED: " + data.message);
+    if (res.ok && data.status === "ok") {
+      appendLog(data.message, "success");
       refreshStatus();
     } else {
-      appendLog("REVERT ERROR: " + (data.message || "Unknown"));
+      appendLog(data.message || `Revert failed (HTTP ${res.status})`, "error");
     }
   } catch (e) {
-    appendLog("Revert request failed: " + e.message);
+    appendLog("Revert request failed: " + e.message, "error");
+  } finally {
+    enableActionButtons(buttons);
   }
-};
+}
 
-function appendLog(msg) {
-  const log = document.getElementById("pr-log");
+function disableActionButtons() {
+  const modal = document.getElementById(MODAL_ID);
+  const buttons = modal ? [...modal.querySelectorAll("[data-action]")] : [];
+  buttons.forEach((b) => (b.disabled = true));
+  return buttons;
+}
+
+function enableActionButtons(buttons) {
+  buttons.forEach((b) => (b.disabled = false));
+}
+
+// ------------------------------------------------------------------
+// Log
+// ------------------------------------------------------------------
+function appendLog(msg, level = "info") {
+  const log = document.getElementById("pri-log");
   if (!log) return;
+  const empty = log.querySelector(".pri-log-empty");
+  if (empty) empty.remove();
   const line = document.createElement("div");
-  line.textContent = "[" + new Date().toLocaleTimeString() + "] " + msg;
+  line.className = `pri-log-line pri-log-line--${level}`;
+  const time = document.createElement("span");
+  time.className = "pri-log-time";
+  time.textContent = new Date().toLocaleTimeString();
+  line.appendChild(time);
+  line.appendChild(document.createTextNode(msg));
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
 }
 
-// Open the modal from the toolbar button (declarative — no DOM hunting needed).
+// ------------------------------------------------------------------
+// Registration
+// ------------------------------------------------------------------
 function openInstaller() {
   openModal();
 }
